@@ -1,0 +1,183 @@
+# -*- coding: utf-8 -*-
+"""
+Hebrew PDF → JSON lines (one line per item), preserving the original content (Q + A together)
+- Detects numbered tokens anywhere: "12.", "12)", "12:", and ".12" (also ".12." / ".12:")
+- Segments by token positions (not by lines)
+- Recursively de-chains inner items so no item swallows the next
+- Output: {"file_path": "...", "items": [{"text": "..."}]}
+- We DO NOT remove punctuation like '?' / ':'; we only collapse spaces and remove invisible bidi chars.
+
+Install if needed:
+    pip install pymupdf pdfminer.six
+"""
+
+from __future__ import annotations
+from typing import List, Tuple, Dict
+import re
+
+# ========= PDF extraction =========
+
+def _extract_text_pymupdf(file_path: str) -> str:
+    import fitz  # PyMuPDF
+    parts = []
+    with fitz.open(file_path) as doc:
+        for page in doc:
+            for b in page.get_text("blocks"):
+                txt = b[4]
+                if txt and txt.strip():
+                    parts.append(txt)
+    return "\n".join(parts)
+
+def _extract_text_pdfminer(file_path: str) -> str:
+    from pdfminer.high_level import extract_text
+    return extract_text(file_path)
+
+def extract_full_text(file_path: str) -> str:
+    try:
+        txt = _extract_text_pymupdf(file_path)
+        if txt and txt.strip():
+            return txt
+    except Exception:
+        pass
+    try:
+        return _extract_text_pdfminer(file_path)
+    except Exception as e:
+        raise RuntimeError(f"לא הצלחתי לחלץ טקסט מה-PDF: {e}")
+
+# ========= Normalization (minimal & RTL-safe) =========
+
+_BIDI_INVIS = {
+    ord("\u200f"): None,  # RLM
+    ord("\u200e"): None,  # LRM
+    ord("\u202a"): None, ord("\u202b"): None, ord("\u202c"): None,
+    ord("\u202d"): None, ord("\u202e"): None,
+    ord("\ufeff"): None,  # BOM
+}
+
+def strip_bidi_invis(s: str) -> str:
+    return s.translate(_BIDI_INVIS)
+
+def normalize_space_minimal(s: str) -> str:
+    # שמירה על פיסוק כפי שהוא; רק הורדת תווי RTL נסתרים וצמצום רווחים/שורות ריקות.
+    s = s.replace("\r", "")
+    s = strip_bidi_invis(s)
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s
+
+def collapse_to_one_line(s: str) -> str:
+    # מאחד לשורה אחת; שומר על הפיסוק המקורי; מנקה רווח לפני פיסוק.
+    s = " ".join(ln.strip() for ln in s.splitlines() if ln.strip())
+    s = re.sub(r"\s+([,.:;!?])", r"\1", s)  # אין רווח לפני פיסוק
+    s = re.sub(r"\s{2,}", " ", s)           # צמצום רווחים כפולים
+    return s.strip()
+
+# ========= Number tokenizer (core) =========
+# LTR token: "12." / "12)" / "12:" (עם/בלי רווח אחר כך)
+TOK_LTR = r"(?:(?<=^)|(?<=\s))(?P<num1>\d{1,3})[).:]"
+# RTL token: ".12" ואפשר מיד אחריו פיסוק כמו '.' או ':' — ".12", ".12.", ".12:"
+TOK_RTL = r"(?:(?<=^)|(?<=\s))\.(?P<num2>\d{1,3})(?=[\s).:,-]|$)"
+TOKENIZER = re.compile(f"{TOK_LTR}|{TOK_RTL}")
+
+def find_tokens(text: str) -> List[Tuple[int, int, int]]:
+    """
+    Returns [(start, end, number), ...] for each numbered token.
+    """
+    out: List[Tuple[int, int, int]] = []
+    for m in TOKENIZER.finditer(text):
+        n = m.group("num1") or m.group("num2")
+        if not n:
+            continue
+        start, end = m.start(), m.end()
+        # אם זה טוקן LTR — נבלע גם רווחים צמודים כדי לחתוך יפה
+        if m.group("num1"):
+            while end < len(text) and text[end] == ' ':
+                end += 1
+        out.append((start, end, int(n)))
+    return out
+
+def segment_by_tokens(text: str) -> List[Tuple[int, str]]:
+    """
+    Splits entire text by token positions.
+    Drops any header before the first token.
+    """
+    toks = find_tokens(text)
+    if not toks:
+        return []
+    segments: List[Tuple[int, str]] = []
+    for i, (s, e, n) in enumerate(toks):
+        nxt = toks[i+1][0] if i+1 < len(toks) else len(text)
+        payload = text[e:nxt]
+        payload = collapse_to_one_line(payload)
+        if payload:
+            segments.append((n, payload))
+    return segments
+
+def recursive_dechain(items: List[Tuple[int, str]]) -> List[Tuple[int, str]]:
+    """
+    If a payload contains more tokens inside — split it recursively
+    so each item stands alone (no swallowed neighbors).
+    """
+    flat: List[Tuple[int, str]] = []
+    changed = False
+    for n, payload in items:
+        inner = find_tokens(payload)
+        if not inner:
+            flat.append((n, payload))
+            continue
+        # יש טוקנים פנימיים — נפרק
+        changed = True
+        parts = segment_by_tokens(payload)
+        # קטע לפני הטוקן הפנימי הראשון שייך ל-n המקורי
+        first_pos = inner[0][0]
+        prefix = collapse_to_one_line(payload[:first_pos])
+        if prefix:
+            flat.append((n, prefix))
+        for nn, pl in parts:
+            flat.append((nn, pl))
+    flat.sort(key=lambda t: t[0])
+    return recursive_dechain(flat) if changed else flat
+
+# ========= Public API =========
+
+def extract_lines_from_pdf(file_path: str) -> Dict:
+    """
+    Returns:
+    {
+      "file_path": "...",
+      "items": [{"text": "<one line as in PDF (Q+A together)>"} ...]
+    }
+    """
+    full = extract_full_text(file_path)
+    full = normalize_space_minimal(full)
+
+    # פיצול ראשוני לפי טוקנים
+    items = segment_by_tokens(full)
+    if not items:
+        # תקן מקרים של ". 12" -> ".12" ואז נסה שוב
+        alt = re.sub(r"\.\s+(\d{1,3})(?=[\s).:,-]|$)", r".\1", full)
+        items = segment_by_tokens(alt)
+
+    # פירוק רקורסיבי של סעיפים פנימיים (למניעת “בליעה”)
+    items = recursive_dechain(items)
+
+    # יצירת JSON קצר ל-LLM
+    out_items: List[Dict[str, str]] = []
+    seen = set()
+    for _, payload in items:
+        text = collapse_to_one_line(payload)  # שורה אחת, שומר פיסוק
+        if not text:
+            continue
+        if text in seen:
+            continue
+        seen.add(text)
+        out_items.append({"text": text})
+
+    return {"file_path": file_path, "items": out_items}
+
+# ==== demo ====
+if __name__ == "__main__":
+    file_path = r"C:/Users/Administrator/Downloads/רונן - שאלון כללי.pdf"
+    data = extract_lines_from_pdf(file_path)
+    import json
+    print(json.dumps(data, ensure_ascii=False, indent=2))
